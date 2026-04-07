@@ -39,6 +39,14 @@ struct TelegramConfig {
 // --- Core Logic ---
 
 fn get_bot_token() -> Result<String, String> {
+    // 1. Try environment variable first (works without keyring)
+    if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+
+    // 2. Fallback to keyring
     let entry = keyring::Entry::new("aitherflow", "telegram-bot-token")
         .map_err(|e| {
             eprintln!("[mcp-telegram-files] Failed to access keyring: {e}");
@@ -46,7 +54,7 @@ fn get_bot_token() -> Result<String, String> {
         })?;
     entry.get_password().map_err(|e| {
         eprintln!("[mcp-telegram-files] Failed to get bot token from keyring: {e}");
-        format!("Failed to get bot token from keyring: {e}")
+        format!("Failed to get bot token from keyring: {e}. Set TELEGRAM_BOT_TOKEN env var as alternative")
     })
 }
 
@@ -151,6 +159,79 @@ fn send_file_to_telegram(
     }
 }
 
+fn send_message_to_telegram(
+    text: &str,
+    client: &reqwest::blocking::Client,
+) -> Result<String, String> {
+    let bot_token = get_bot_token()?;
+    let config = get_telegram_config()?;
+
+    let chat_id = match &config.chat_id {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        _ => return Err("Invalid chat_id in telegram.json".to_string()),
+    };
+
+    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+
+    // Split long messages at 4000 chars (Telegram limit is 4096)
+    let chunks = split_message(text, 4000);
+    for chunk in &chunks {
+        let body = json!({
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+        });
+
+        let resp = client.post(&url).json(&body).send().map_err(|e| {
+            let msg = e.to_string().replace(&bot_token, "<TOKEN>");
+            format!("HTTP request failed: {msg}")
+        })?;
+
+        let status = resp.status();
+        let body_text = resp.text().unwrap_or_default();
+
+        if !status.is_success() {
+            let parsed: Value = serde_json::from_str(&body_text).unwrap_or_default();
+            let description = parsed
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("Unknown error");
+            return Err(format!("Telegram API error: {description}"));
+        }
+    }
+
+    Ok(format!("Message sent ({} chars)", text.len()))
+}
+
+fn split_message(text: &str, max_len: usize) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return vec![];
+    }
+    if text.len() <= max_len {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        if remaining.len() <= max_len {
+            chunks.push(remaining.to_string());
+            break;
+        }
+        let mut boundary = max_len;
+        while boundary > 0 && !remaining.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        let split_at = remaining[..boundary].rfind('\n').unwrap_or(boundary);
+        let split_at = if split_at == 0 { boundary } else { split_at };
+        chunks.push(remaining[..split_at].to_string());
+        remaining = remaining[split_at..].trim_start_matches('\n');
+    }
+    chunks
+}
+
 // --- MCP Handlers ---
 
 fn handle_initialize(id: Value) -> JsonRpcResponse {
@@ -190,6 +271,20 @@ fn handle_tools_list(id: Value) -> JsonRpcResponse {
                         },
                         "required": ["path"]
                     }
+                },
+                {
+                    "name": "send_message_to_telegram",
+                    "description": "Send a text message to the configured Telegram chat. Supports HTML formatting: <b>bold</b>, <i>italic</i>, <u>underline</u>, <s>strikethrough</s>, <code>code</code>, <pre>pre</pre>, <a href=\"url\">link</a>, <blockquote>quote</blockquote>. Long messages are automatically split.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "text": {
+                                "type": "string",
+                                "description": "The message text (HTML formatting supported)"
+                            }
+                        },
+                        "required": ["text"]
+                    }
                 }
             ]
         })),
@@ -204,37 +299,39 @@ fn handle_tools_call(
 ) -> JsonRpcResponse {
     let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
 
-    if tool_name != "send_file_to_telegram" {
-        return JsonRpcResponse {
-            jsonrpc: "2.0".into(),
-            id,
-            result: None,
-            error: Some(json!({
-                "code": -32602,
-                "message": format!("Unknown tool: {tool_name}")
-            })),
-        };
-    }
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    let path = params
-        .get("arguments")
-        .and_then(|a| a.get("path"))
-        .and_then(|p| p.as_str())
-        .unwrap_or("");
+    let result = match tool_name {
+        "send_file_to_telegram" => {
+            let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            if path.is_empty() {
+                Err("'path' parameter is required".into())
+            } else {
+                send_file_to_telegram(path, client)
+            }
+        }
+        "send_message_to_telegram" => {
+            let text = args.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            if text.is_empty() {
+                Err("'text' parameter is required".into())
+            } else {
+                send_message_to_telegram(text, client)
+            }
+        }
+        _ => {
+            return JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id,
+                result: None,
+                error: Some(json!({
+                    "code": -32602,
+                    "message": format!("Unknown tool: {tool_name}")
+                })),
+            };
+        }
+    };
 
-    if path.is_empty() {
-        return JsonRpcResponse {
-            jsonrpc: "2.0".into(),
-            id,
-            result: Some(json!({
-                "content": [{"type": "text", "text": "Error: 'path' parameter is required"}],
-                "isError": true
-            })),
-            error: None,
-        };
-    }
-
-    match send_file_to_telegram(path, client) {
+    match result {
         Ok(msg) => JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id,
